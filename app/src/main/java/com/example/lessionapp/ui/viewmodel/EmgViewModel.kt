@@ -92,6 +92,9 @@ class EmgViewModel(
     private val _hasSensorData = MutableStateFlow(false)
     val hasSensorData: StateFlow<Boolean> = _hasSensorData.asStateFlow()
 
+    private val _latestEsp32TimestampMillis = MutableStateFlow<Long?>(null)
+    val latestEsp32TimestampMillis: StateFlow<Long?> = _latestEsp32TimestampMillis.asStateFlow()
+
     private val _chartDataPoints = MutableStateFlow<List<Double>>(emptyList())
     val chartDataPoints: StateFlow<List<Double>> = _chartDataPoints.asStateFlow()
 
@@ -130,9 +133,9 @@ class EmgViewModel(
                     bleManager.connectionState.value == BleConnectionState.CONNECTED
                 ) {
                     processAndRecordEmgData(
-                        rawAdc = sample.adcRaw,
-                        measuredOutputMv = sample.outputMillivolts
+                        rawAdc = sample.adcRaw
                     )
+                    _latestEsp32TimestampMillis.value = sample.timestampMillis
                 }
             }
         }
@@ -157,7 +160,7 @@ class EmgViewModel(
     }
 
     fun setDataSourceMode(mode: DataSourceMode) {
-        if (_dataSourceMode.value == mode && mode == DataSourceMode.SIMULATION) return
+        if (_dataSourceMode.value == mode) return
         _dataSourceMode.value = mode
         stopRecordingSession()
         clearLiveData()
@@ -196,6 +199,7 @@ class EmgViewModel(
             bleManager.connectionState.value == BleConnectionState.CONNECTED
         ) return
         _selectedBleDevice.value = device
+        setDataSourceMode(DataSourceMode.REAL_BLE)
         bleManager.connect(device.address)
     }
     fun disconnectBleDevice() { bleManager.disconnect() }
@@ -271,6 +275,7 @@ class EmgViewModel(
             signalProcessor.resetFilter()
             simulationGenerator.reset()
             _hasSensorData.value = false
+            _latestEsp32TimestampMillis.value = null
             _latestSensorData.value = EmgSensorData(0, 0.0, 0.0, 0.0)
             sessionStartTime = System.currentTimeMillis()
             sampleCount = 0
@@ -313,6 +318,7 @@ class EmgViewModel(
 
     private fun clearLiveData() {
         _hasSensorData.value = false
+        _latestEsp32TimestampMillis.value = null
         _latestSensorData.value = EmgSensorData(0, 0.0, 0.0, 0.0)
         _chartDataPoints.value = emptyList()
         signalProcessor.resetFilter()
@@ -375,7 +381,7 @@ class EmgViewModel(
                 sessionTitle = if (_dataSourceMode.value == DataSourceMode.SIMULATION) {
                     "Sesión simulada EMG"
                 } else {
-                    "Sesión BLE ESP32-C3 · emgEnvelope SIG"
+                    "Sesión BLE ESP32 · ADC UART"
                 },
                 startTime = sessionStartTime,
                 endTime = System.currentTimeMillis(),

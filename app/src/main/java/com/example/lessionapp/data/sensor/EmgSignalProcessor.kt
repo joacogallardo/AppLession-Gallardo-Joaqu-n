@@ -7,7 +7,7 @@ import kotlin.math.sqrt
  */
 data class EmgSensorData(
     val rawAdc: Int,               // Valor digital directo del ADC de 12 bits (0 - 4095)
-    val voltageMv: Double,         // mV medidos por firmware en SIG para BLE o derivados del ADC en simulación
+    val voltageMv: Double,         // mV derivados del ADC; la app no recibe un voltaje BLE directo
     val filteredVoltageMv: Double, // Media móvil calculada de la señal de salida
     val rmsVoltageMv: Double,      // RMS calculado de la señal de salida; no es lectura directa del sensor
     val activationPercentage: Double = 0.0, // Porcentaje de activación muscular calibrado (% MVC 0-100%)

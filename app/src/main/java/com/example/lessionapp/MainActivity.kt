@@ -271,6 +271,7 @@ private fun TrainingScreen(
     val chartDataPoints by viewModel.chartDataPoints.collectAsState()
     val dataSourceMode by viewModel.dataSourceMode.collectAsState()
     val bleState by viewModel.bleConnectionState.collectAsState()
+    val esp32Timestamp by viewModel.latestEsp32TimestampMillis.collectAsState()
     val isInReferenceRange = hasSensorData && sensorData.voltageMv in 100.0..3000.0
     val canStartTraining = !isRecording &&
         (dataSourceMode == DataSourceMode.SIMULATION ||
@@ -301,12 +302,14 @@ private fun TrainingScreen(
                     Spacer(Modifier.height(8.dp))
                     Text(
                         text = when {
-                            dataSourceMode == DataSourceMode.REAL_BLE && bleState == BleConnectionState.CONNECTED && hasSensorData ->
-                                "ESP32-C3 conectado; datos recibidos por BLE."
                             dataSourceMode == DataSourceMode.REAL_BLE && bleState == BleConnectionState.CONNECTED ->
-                                "ESP32-C3 conectado; esperando datos del sensor."
+                                "ESP32 conectado; recibiendo datos ADC reales por BLE."
+                            dataSourceMode == DataSourceMode.REAL_BLE && bleState == BleConnectionState.CONNECTING ->
+                                "Conectando al ESP32; esperando una muestra real. La simulación está desactivada."
+                            dataSourceMode == DataSourceMode.REAL_BLE && bleState == BleConnectionState.ERROR ->
+                                "Error de conexión BLE. No se generan datos simulados."
                             dataSourceMode == DataSourceMode.REAL_BLE ->
-                                "Bluetooth sin conexión. No se generan datos; reconectá el ESP32-C3."
+                                "Bluetooth desconectado. No se generan datos simulados."
                             else -> "Modo simulación seleccionado; los datos comienzan al iniciar el entrenamiento."
                         },
                         style = MaterialTheme.typography.bodyMedium
@@ -319,6 +322,20 @@ private fun TrainingScreen(
                     )
                     if (dataSourceMode == DataSourceMode.REAL_BLE) {
                         Spacer(Modifier.height(8.dp))
+                        if (bleState == BleConnectionState.CONNECTING ||
+                            bleState == BleConnectionState.CONNECTED
+                        ) {
+                            ProaSecondaryButton(
+                                text = if (bleState == BleConnectionState.CONNECTING) {
+                                    "Cancelar conexión"
+                                } else {
+                                    "Desconectar dispositivo"
+                                },
+                                onClick = { viewModel.disconnectBleDevice() },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(8.dp))
+                        }
                         ProaOutlinedButton(
                             text = "Cambiar a simulación",
                             onClick = { viewModel.setDataSourceMode(DataSourceMode.SIMULATION) },
@@ -356,7 +373,7 @@ private fun TrainingScreen(
                     ProaEmgChart(dataPoints = chartDataPoints, maxValue = 3300.0)
                     Text(
                         text = if (dataSourceMode == DataSourceMode.REAL_BLE) {
-                            "Salida SIG reportada por el ESP32 (emgEnvelope), en mV."
+                            "ADC real recibido (0–4095); el gráfico y los mV son conversiones del ADC usando 3,3 V como referencia."
                         } else {
                             "Señal simulada; el voltaje se deriva del ADC y no es una medición muscular."
                         },
@@ -371,15 +388,15 @@ private fun TrainingScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = if (dataSourceMode == DataSourceMode.REAL_BLE) {
-                                    "Última salida SIG"
+                                    "ADC recibido · 12 bits"
                                 } else {
-                                    "Voltaje simulado"
+                                    "ADC simulado"
                                 },
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
-                                text = if (hasSensorData) "%.1f mV".format(sensorData.voltageMv) else "Esperando datos",
+                                text = if (hasSensorData) "${sensorData.rawAdc} / 4095" else "Esperando datos",
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.Bold,
                                 color = ProaBluePrimary
@@ -387,12 +404,22 @@ private fun TrainingScreen(
                         }
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "ADC SIG · 12 bits",
+                                text = if (dataSourceMode == DataSourceMode.REAL_BLE) {
+                                    "Tiempo ESP32"
+                                } else {
+                                    "Voltaje derivado"
+                                },
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
-                                text = if (hasSensorData) "${sensorData.rawAdc} / 4095" else "—",
+                                text = if (dataSourceMode == DataSourceMode.REAL_BLE) {
+                                    esp32Timestamp?.let { "$it ms" } ?: "—"
+                                } else if (hasSensorData) {
+                                    "%.1f mV".format(sensorData.voltageMv)
+                                } else {
+                                    "—"
+                                },
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.Bold,
                                 color = ProaBluePrimary
@@ -470,7 +497,7 @@ private fun TrainingScreen(
                     if (faqExpanded) {
                         SignalFaqItem(
                             "¿Qué es el voltaje de origen muscular?",
-                            "La señal muscular original se mide en µV o mV entre electrodos. Este firmware reporta en cambio el voltaje de salida del pin SIG, leído por analogReadMilliVolts y enviado como emgEnvelope. No es el voltaje original de los electrodos."
+                            "La ESP32 transmite el conteo ADC de la entrada conectada al sensor (0–4095). La app no recibe directamente el voltaje diferencial original de los electrodos."
                         )
                         SignalFaqItem(
                             "¿Qué significa diferencia de potencial?",
@@ -478,18 +505,18 @@ private fun TrainingScreen(
                         )
                         SignalFaqItem(
                             "¿Qué es la frecuencia de los impulsos?",
-                            "Describe cambios eléctricos por segundo (Hz). No se obtiene aquí: con una muestra cada 500 ms (2 Hz) no alcanza para medir los impulsos EMG. Se necesitarían datos RAW muestreados mucho más rápido."
+                            "Describe cambios eléctricos por segundo (Hz). El flujo actual es de aproximadamente 50 muestras por segundo; no alcanza para caracterizar correctamente el contenido de frecuencia típico de una señal EMG."
                         )
                         SignalFaqItem(
                             "¿Qué indica la amplitud?",
-                            "Es el tamaño de las variaciones eléctricas. La app calcula máximo menos mínimo sobre las muestras visibles de SIG etiquetadas emgEnvelope; no es una lectura directa de fuerza ni de la amplitud original muscular."
+                            "Es el tamaño de las variaciones eléctricas. La app grafica los valores ADC recibidos; no son una lectura directa de fuerza ni de la señal diferencial original del músculo."
                         )
                         SignalFaqItem(
                             "¿Qué son el ruido y el electrodo de referencia?",
                             "El ambiente puede agregar interferencias eléctricas. El electrodo de referencia ayuda al circuito a estabilizar la medición, pero no entrega por sí solo un valor de ruido. La app no puede cuantificarlo con los datos actuales."
                         )
                         Text(
-                            text =                             "El JSON del firmware etiqueta la señal como emgEnvelope y toma SIG. No especifica el modelo/revisión del módulo ni confirma si ese pin corresponde a RAW, RECT o ENV; la app conserva la etiqueta del firmware sin inferirlo.",
+                            text = "El protocolo recibido es ASCII: tiempo_ms,valor_ADC. El valor ADC es la lectura directa; la conversión a mV que muestra la app se calcula usando 3,3 V como referencia.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -563,7 +590,7 @@ private fun BluetoothScreen(
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "La búsqueda muestra únicamente dispositivos que anuncian el servicio BLE EMG del proyecto (${BleEmgManager.EMG_SERVICE_UUID}). Se identifican por dirección y su RSSI se actualiza durante el escaneo.",
+                text = "Escaneo BLE activo: aparecen los dispositivos cercanos. ESP32 LESSION se identifica por nombre completo y servicio ${BleEmgManager.EMG_SERVICE_UUID}.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Spacer(Modifier.height(12.dp))
@@ -592,7 +619,7 @@ private fun BluetoothScreen(
 
         ProaCard {
             Text(
-                text = "ESP32 compatibles encontrados",
+                text = "Dispositivos BLE encontrados",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
                 color = ProaBluePrimary
@@ -603,7 +630,7 @@ private fun BluetoothScreen(
                     text = if (state == BleConnectionState.SCANNING) {
                         "Buscando…"
                     } else {
-                        "No hay resultados de la búsqueda actual. Iniciá una búsqueda para encontrar dispositivos BLE cercanos."
+                        "No hay resultados todavía. Iniciá una búsqueda para encontrar dispositivos BLE cercanos."
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = Color.Gray
@@ -645,7 +672,7 @@ private fun BluetoothScreen(
                     RegisteredBleDeviceRow(
                         device = registered,
                         rssi = liveDevice?.rssi,
-                        isEmgCompatible = liveDevice?.advertisesEmgService == true,
+                        isEmgCompatible = liveDevice?.isEsp32Device == true,
                         isSelected = selected?.address == registered.address,
                         onSelect = {
                             viewModel.selectBleDevice(
@@ -685,15 +712,17 @@ private fun BluetoothScreen(
             )
             if (state == BleConnectionState.CONNECTED && hasSensorData) {
                 Text(
-                    text = "ADC SIG: ${sensorData.rawAdc} cuentas · %.1f mV".format(sensorData.voltageMv),
+                    text = "ADC recibido: ${sensorData.rawAdc} / 4095",
                     style = MaterialTheme.typography.bodyMedium,
                     color = ProaBluePrimary
                 )
             }
-            if (state == BleConnectionState.CONNECTED) {
+            if (state == BleConnectionState.CONNECTING ||
+                state == BleConnectionState.CONNECTED
+            ) {
                 Spacer(Modifier.height(8.dp))
                 ProaSecondaryButton(
-                    "Desconectar",
+                    if (state == BleConnectionState.CONNECTING) "Cancelar conexión" else "Desconectar",
                     { viewModel.disconnectBleDevice() },
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -771,7 +800,11 @@ private fun BleDeviceRow(
                 style = MaterialTheme.typography.bodySmall
             )
             Text(
-                text = if (device.advertisesEmgService) "Servicio EMG anunciado" else "BLE general",
+                text = if (device.isEsp32Device) {
+                    "ESP32 LESSION · nombre y servicio confirmados"
+                } else {
+                    "Dispositivo BLE"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

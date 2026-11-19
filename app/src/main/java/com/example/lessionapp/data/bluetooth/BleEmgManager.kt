@@ -45,7 +45,8 @@ data class BleDeviceInfo(
     val name: String,
     val address: String,
     val rssi: Int,
-    val advertisesEmgService: Boolean = false
+    val advertisesEmgService: Boolean = false,
+    val isEsp32Device: Boolean = false
 )
 
 data class RegisteredBleDevice(
@@ -55,9 +56,7 @@ data class RegisteredBleDevice(
 
 data class BleEmgSample(
     val adcRaw: Int,
-    val outputMillivolts: Double,
-    val metric: String,
-    val timestamp: Long
+    val timestampMillis: Long
 )
 
 /**
@@ -91,18 +90,25 @@ class BleEmgManager(private val context: Context) {
     private var bluetoothGatt: BluetoothGatt? = null
     private var disconnectRequested = false
     private var isScanning = false
+    private var discardingOversizedLine = false
+    private val lineBufferLock = Any()
+    private val lineBuffer = StringBuilder()
     private val handler = Handler(Looper.getMainLooper())
     private val scanStopRunnable = Runnable { stopScan() }
 
     companion object {
         private const val TAG = "LessionBLE"
         val EMG_SERVICE_UUID: UUID =
-            UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
-        val EMG_CHARACTERISTIC_UUID: UUID =
-            UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a8")
+            UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+        val EMG_TX_CHARACTERISTIC_UUID: UUID =
+            UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+        val EMG_RX_CHARACTERISTIC_UUID: UUID =
+            UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
         private val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val SCAN_PERIOD_MS = 10000L
+        private const val MAX_LINE_LENGTH = 64
+        private const val ESP32_DEVICE_NAME = "ESP32 LESSION"
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -110,21 +116,31 @@ class BleEmgManager(private val context: Context) {
             val device = result.device
             val advertisesEmgService = result.scanRecord?.serviceUuids
                 ?.any { it.uuid == EMG_SERVICE_UUID } == true
-            if (!advertisesEmgService) return
 
             val name = try {
-                device.name ?: result.scanRecord?.deviceName ?: "Nombre no disponible"
+                result.scanRecord?.deviceName ?: device.name
             } catch (_: SecurityException) {
-                result.scanRecord?.deviceName ?: "Nombre no disponible"
+                result.scanRecord?.deviceName
+            } ?: "Nombre no disponible"
+            val existing = _scannedDevices.value.firstOrNull { it.address == device.address }
+            val resolvedName = if (name == "Nombre no disponible" && existing != null) {
+                existing.name
+            } else {
+                name
             }
-            val deviceInfo = BleDeviceInfo(name, device.address, result.rssi, true)
-            _scannedDevices.value = _scannedDevices.value
-                .associateBy { it.address }
-                .toMutableMap()
-                .apply { put(device.address, deviceInfo) }
-                .values
+            val advertisesService = advertisesEmgService || existing?.advertisesEmgService == true
+            val isEsp32Device = resolvedName == ESP32_DEVICE_NAME && advertisesService
+            val deviceInfo = BleDeviceInfo(
+                name = resolvedName,
+                address = device.address,
+                rssi = result.rssi,
+                advertisesEmgService = advertisesService,
+                isEsp32Device = isEsp32Device
+            )
+            _scannedDevices.value = (_scannedDevices.value
+                .filterNot { it.address == device.address } + deviceInfo)
                 .sortedByDescending { it.rssi }
-            Log.d(TAG, "Dispositivo BLE detectado/actualizado: name=$name address=${device.address} rssi=${result.rssi} emgService=$advertisesEmgService")
+            Log.d(TAG, "Dispositivo BLE detectado/actualizado: name=$resolvedName address=${device.address} rssi=${result.rssi} esp32=$isEsp32Device")
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -184,24 +200,28 @@ class BleEmgManager(private val context: Context) {
             } else {
                 "Conectado; GATT: ${characteristicDetails.joinToString()}"
             }
-            val characteristic = gatt.getService(EMG_SERVICE_UUID)
-                ?.getCharacteristic(EMG_CHARACTERISTIC_UUID)
+            val emgService = gatt.getService(EMG_SERVICE_UUID)
+            val characteristic = emgService?.getCharacteristic(EMG_TX_CHARACTERISTIC_UUID)
             if (characteristic == null ||
                 characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0
             ) {
                 _isEmgCompatible.value = false
                 _connectionDetails.value =
-                    "Conectado; dispositivo no compatible con EMG (no ofrece el servicio y característica de notificación requeridos)."
+                    "Dispositivo no compatible: falta el servicio UART o TX notificable."
                 Log.i(TAG, _connectionDetails.value)
-                _connectionState.value = BleConnectionState.CONNECTED
+                _connectionState.value = BleConnectionState.ERROR
+                closeGatt()
                 return
             }
+            val hasRx = emgService.getCharacteristic(EMG_RX_CHARACTERISTIC_UUID) != null
+            if (!hasRx) Log.w(TAG, "No se encontró RX; recepción TX puede continuar, pero no habrá canal de escritura.")
             val descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
             if (descriptor == null || !gatt.setCharacteristicNotification(characteristic, true)) {
                 _isEmgCompatible.value = false
-                _connectionDetails.value = "Conectado; el dispositivo no permite habilitar notificaciones EMG."
+                _connectionDetails.value = "No se pudieron habilitar notificaciones TX."
                 Log.w(TAG, _connectionDetails.value)
-                _connectionState.value = BleConnectionState.CONNECTED
+                _connectionState.value = BleConnectionState.ERROR
+                closeGatt()
                 return
             }
             val writeStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -210,14 +230,18 @@ class BleEmgManager(private val context: Context) {
                     BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 ) == BluetoothStatusCodes.SUCCESS
             } else {
-                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
+                @Suppress("DEPRECATION")
+                run {
+                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(descriptor)
+                }
             }
             if (!writeStarted) {
                 _isEmgCompatible.value = false
-                _connectionDetails.value = "Conectado; no se pudieron habilitar notificaciones EMG."
+                _connectionDetails.value = "No se pudo escribir el descriptor CCCD de TX."
                 Log.w(TAG, _connectionDetails.value)
-                _connectionState.value = BleConnectionState.CONNECTED
+                _connectionState.value = BleConnectionState.ERROR
+                closeGatt()
             }
         }
 
@@ -229,11 +253,14 @@ class BleEmgManager(private val context: Context) {
             if (descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIG_UUID) {
                 Log.i(TAG, "Escritura del descriptor de notificaciones finalizada. status=$status")
                 _isEmgCompatible.value = status == BluetoothGatt.GATT_SUCCESS
-                _connectionState.value = BleConnectionState.CONNECTED
                 _connectionDetails.value = if (status == BluetoothGatt.GATT_SUCCESS) {
-                    "Conectado; dispositivo compatible con EMG, recibiendo notificaciones."
+                    "Notificaciones TX habilitadas; esperando la primera muestra real."
                 } else {
-                    "Conectado, pero no se pudieron habilitar notificaciones EMG."
+                    "No se pudieron habilitar notificaciones TX (código $status)."
+                }
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    _connectionState.value = BleConnectionState.ERROR
+                    closeGatt()
                 }
             }
         }
@@ -243,8 +270,8 @@ class BleEmgManager(private val context: Context) {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            if (characteristic.uuid == EMG_CHARACTERISTIC_UUID) {
-                characteristic.value?.let(::parseEmgNotification)
+            if (characteristic.uuid == EMG_TX_CHARACTERISTIC_UUID) {
+                characteristic.value?.let(::appendIncomingBytes)
             }
         }
 
@@ -253,44 +280,69 @@ class BleEmgManager(private val context: Context) {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            if (characteristic.uuid == EMG_CHARACTERISTIC_UUID) {
-                parseEmgNotification(value)
+            if (characteristic.uuid == EMG_TX_CHARACTERISTIC_UUID) {
+                appendIncomingBytes(value)
             }
         }
     }
 
-    private fun parseEmgNotification(payload: ByteArray) {
-        val json = try {
-            JSONObject(payload.toString(Charsets.UTF_8))
-        } catch (error: org.json.JSONException) {
-            Log.w(TAG, "Notificación BLE descartada: JSON inválido.", error)
-            return
+    private fun appendIncomingBytes(bytes: ByteArray) {
+        synchronized(lineBufferLock) {
+            bytes.forEach { byte ->
+                when (byte.toInt() and 0xFF) {
+                    0x0A -> {
+                        if (discardingOversizedLine) {
+                            discardingOversizedLine = false
+                            lineBuffer.clear()
+                            return@forEach
+                        }
+                        val line = lineBuffer.toString().trimEnd('\r')
+                        lineBuffer.clear()
+                        if (line.isNotBlank()) parseSampleLine(line)
+                    }
+                    else -> {
+                        if (discardingOversizedLine) {
+                            return@forEach
+                        } else if (lineBuffer.length >= MAX_LINE_LENGTH) {
+                            Log.w(TAG, "Línea BLE demasiado larga; se descarta.")
+                            lineBuffer.clear()
+                            discardingOversizedLine = true
+                        } else {
+                            lineBuffer.append((byte.toInt() and 0xFF).toChar())
+                        }
+                    }
+                }
+            }
         }
-        if (json.optString("type") != "emg" ||
-            json.optString("sensor") != "emg_module" ||
-            json.optString("status") != "valid" ||
-            json.optString("unit") != "mV" ||
-            json.optString("metric") != "emgEnvelope"
-        ) {
-            Log.w(TAG, "Notificación BLE ignorada: tipo, sensor, estado, unidad o métrica inesperados.")
-            return
-        }
+    }
 
-        val adcRaw = json.optInt("adcRaw", -1)
-        val value = json.optDouble("value", Double.NaN)
-        if (adcRaw !in 0..4095 || !value.isFinite() || value < 0.0) {
-            Log.w(TAG, "Notificación BLE ignorada: valores fuera de formato. adcRaw=$adcRaw value=$value")
+    private fun parseSampleLine(line: String) {
+        val fields = line.split(',')
+        if (fields.size != 2) {
+            Log.w(TAG, "Línea BLE ignorada: se esperaban tiempo_ms,valor_ADC; recibido='$line'")
             return
         }
-
-        _incomingEmgFlow.tryEmit(
-            BleEmgSample(
-                adcRaw = adcRaw,
-                outputMillivolts = value,
-                metric = json.getString("metric"),
-                timestamp = json.optLong("timestamp", 0L)
-            )
+        val timestamp = fields[0].trim().toLongOrNull()
+        val adcRaw = fields[1].trim().toIntOrNull()
+        if (timestamp == null || timestamp < 0L || adcRaw == null || adcRaw !in 0..4095) {
+            Log.w(TAG, "Línea BLE ignorada: valores inválidos; recibido='$line'")
+            return
+        }
+        _connectionDetails.value = "Conectado; recibiendo ADC real (última muestra ESP32: ${timestamp} ms)."
+        _connectionState.value = BleConnectionState.CONNECTED
+        Log.i(
+            TAG,
+            JSONObject()
+                .put("evento", "datos.ingresados.esp32")
+                .put(
+                    "datos",
+                    JSONObject()
+                        .put("tiempo_ms", timestamp)
+                        .put("valor_ADC", adcRaw)
+                )
+                .toString()
         )
+        _incomingEmgFlow.tryEmit(BleEmgSample(adcRaw, timestamp))
     }
 
     fun startScan() {
@@ -314,6 +366,7 @@ class BleEmgManager(private val context: Context) {
                 ?: throw IllegalStateException("El escáner Bluetooth LE no está disponible.")
             val settings = ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setReportDelay(0L)
                 .build()
             scanner.startScan(null, settings, scanCallback)
             handler.removeCallbacks(scanStopRunnable)
@@ -357,6 +410,10 @@ class BleEmgManager(private val context: Context) {
             bluetoothGatt = null
             disconnectRequested = false
             _isEmgCompatible.value = false
+            synchronized(lineBufferLock) {
+                lineBuffer.clear()
+                discardingOversizedLine = false
+            }
             _discoveredServices.value = emptyList()
             _connectionState.value = BleConnectionState.CONNECTING
             _connectionDetails.value = "Conectando y consultando servicios GATT."
@@ -396,6 +453,10 @@ class BleEmgManager(private val context: Context) {
         bluetoothGatt = null
         _connectionState.value = BleConnectionState.DISCONNECTED
         _isEmgCompatible.value = false
+        synchronized(lineBufferLock) {
+            lineBuffer.clear()
+            discardingOversizedLine = false
+        }
         _connectionDetails.value = "Desconectado."
     }
 

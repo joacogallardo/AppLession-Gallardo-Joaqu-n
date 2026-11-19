@@ -158,7 +158,7 @@ fun HistoryScreen(
                             )
                             Spacer(Modifier.height(8.dp))
                             Text(
-                                text = "ADC y valor en mV guardados por muestra. En sesiones BLE nuevas, mV corresponde a la salida SIG (emgEnvelope) reportada por el firmware; en simulaciones es derivado del ADC.",
+                                text = "ADC recibido y conversión a mV guardados por muestra. En BLE el valor ADC proviene del ESP32; los mV se calculan en la app usando 3,3 V como referencia. En simulación ambos valores son simulados.",
                                 style = MaterialTheme.typography.bodyMedium
                             )
                             if (records.isNotEmpty()) {
